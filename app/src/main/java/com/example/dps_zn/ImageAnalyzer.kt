@@ -18,8 +18,6 @@ import androidx.camera.core.ImageProxy
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.support.common.FileUtil
-import org.tensorflow.lite.support.image.ImageProcessor
-import org.tensorflow.lite.support.image.TensorImage
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.InputStreamReader
@@ -32,8 +30,13 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Анализ кадра: TFLite Support, YOLOv8, телеметрия.
- * Модель грузится лениво при первом кадре (не блокирует UI).
+ * Анализатор кадра камеры: YOLOv8 TFLite (INT8/FLOAT32) → letterbox → инференс → NMS → overlay.
+ *
+ * Особенности:
+ *  - Модель и метки загружаются лениво при первом кадре.
+ *  - Универсальный парсер выхода: [1, 4+nc, A] и [1, A, 4+nc], FLOAT32/UINT8/INT8.
+ *  - Имена классов берутся из labels.txt (латинские), для отрисовки переводятся в русские
+ *    через [RUSSIAN_LABELS]. Если перевода нет — показываем исходное имя.
  */
 class ImageAnalyzer(
     context: Context,
@@ -44,173 +47,158 @@ class ImageAnalyzer(
 
     private val initLock = Any()
     private var interpreter: Interpreter? = null
-    private var labelsAll: List<String> = emptyList()
-    private var labelsForModel: List<String> = emptyList()
-    private var imageProcessor: ImageProcessor? = null
-    private var inputIsUint8: Boolean = false
-    private var outputTotal: Int = 0
-    private var outputShape: IntArray = intArrayOf()
+    private var classNames: List<String> = emptyList()
+
+    private var inputDataType: DataType = DataType.FLOAT32
+    private var inputQuantScale: Float = 1f
+    private var inputQuantZeroPoint: Int = 0
+    private var inputWidth: Int = MODEL_SIZE
+    private var inputHeight: Int = MODEL_SIZE
+
     private var outputDataType: DataType = DataType.FLOAT32
     private var outputQuantScale: Float = 1f
     private var outputQuantZeroPoint: Int = 0
-    private lateinit var outputFloatBuffer: FloatArray
-    private var outputRawBuffer: ByteBuffer? = null
-    private var outputQuantBytes: ByteArray? = null
-    private var inputBufferDirect: ByteBuffer? = null
+    private var outputShape: IntArray = intArrayOf()
+    private var outputTotal: Int = 0
     private var outputClassCount: Int = 0
 
-    private val ignoreLabels = setOf("null")
+    private var inputBuffer: ByteBuffer? = null
+    private var outputBuffer: ByteBuffer? = null
+    private var outputFloats: FloatArray = FloatArray(0)
+    private var pixelBuffer: IntArray = IntArray(0)
+
     private val lastTelemetryAtMs = ConcurrentHashMap<String, Long>()
     private val telemetryCooldownMs = 10_000L
     private val letterboxPaint = Paint(Paint.FILTER_BITMAP_FLAG)
 
+    /**
+     * Сглаживает выход YOLO между кадрами: рамка появляется только после нескольких
+     * подтверждений и держится ещё несколько кадров после потери. Используется только
+     * из analysis-потока, поэтому без синхронизации.
+     */
+    private val stabilizer = DetectionStabilizer()
+
+    /** Порог уверенности можно менять на лету из настроек; читается на каждом кадре. */
     @Volatile
-    private var loggedTensorMeta = false
+    var confidenceThreshold: Float = DEFAULT_CONF_THRESHOLD
+
     @Volatile
-    private var loggedFrameMeta = false
-    private var analyzedFrameIndex = 0L
-    private var detectionTracks: List<TrackedBox> = emptyList()
+    private var loggedMeta = false
+    private var frameIndex = 0L
 
     private fun ensureEngine() {
         if (interpreter != null) return
         synchronized(initLock) {
             if (interpreter != null) return
-            val model = FileUtil.loadMappedFile(appContext, "best_int8.tflite")
-            val interp = Interpreter(
-                model,
-                Interpreter.Options().apply { setNumThreads(4) }
-            )
-            val lbls = appContext.assets.open("labels.txt").use { stream ->
+
+            val model = FileUtil.loadMappedFile(appContext, MODEL_FILE)
+            val interp = Interpreter(model, Interpreter.Options().apply { setNumThreads(4) })
+
+            val rawLabels = appContext.assets.open(LABELS_FILE).use { stream ->
                 BufferedReader(InputStreamReader(stream)).lineSequence()
-                    .map { it.trim() }
+                    .map { it.trim().trimEnd('\\') }
                     .filter { it.isNotEmpty() }
-                    .map { normalizeLabel(it) }
                     .toList()
             }
+
             val inTensor = interp.getInputTensor(0)
-            val uint8 = inTensor.dataType() == DataType.UINT8
-            val proc = ImageProcessor.Builder()
-                .build()
             val outTensor = interp.getOutputTensor(0)
-            val shape = outTensor.shape()
-            val classCount = inferClassCount(shape)
-            val modelLbls = buildModelLabels(lbls, classCount)
-            val inQuant = inTensor.quantizationParams()
-            val outQuant = outTensor.quantizationParams()
-            Log.d(TAG_DEBUG, "Labels size: ${lbls.size}, first label: ${lbls.getOrNull(0)}")
-            Log.d(TAG_DEBUG, "Model classes: $classCount, labels used: $modelLbls")
-            if (ENABLE_DEBUG_LOGS) {
-                Log.i(
-                    TAG_DEBUG,
-                    "input shape=${inTensor.shape().contentToString()} dtype=${inTensor.dataType()} " +
-                        "qScale=${inQuant.scale} qZero=${inQuant.zeroPoint}"
-                )
-                Log.i(
-                    TAG_DEBUG,
-                    "output shape=${shape.contentToString()} dtype=${outTensor.dataType()} " +
-                        "qScale=${outQuant.scale} qZero=${outQuant.zeroPoint} " +
-                        "outputs=${interp.outputTensorCount} labelsRaw=${lbls.size} labelsActive=${modelLbls.size}"
+            val inShape = inTensor.shape()
+            val outShape = outTensor.shape()
+
+            if (inShape.size == 4) {
+                inputHeight = inShape[1]
+                inputWidth = inShape[2]
+            }
+
+            inputDataType = inTensor.dataType()
+            outputDataType = outTensor.dataType()
+            inTensor.quantizationParams().let {
+                inputQuantScale = it.scale
+                inputQuantZeroPoint = it.zeroPoint
+            }
+            outTensor.quantizationParams().let {
+                outputQuantScale = it.scale
+                outputQuantZeroPoint = it.zeroPoint
+            }
+
+            outputShape = outShape
+            outputTotal = outShape.fold(1, Int::times)
+            outputClassCount = inferClassCount(outShape)
+
+            // Метки берём ровно столько, сколько классов у модели; лишнее в labels.txt игнорируем.
+            classNames = when {
+                outputClassCount > 0 && rawLabels.size >= outputClassCount -> rawLabels.take(outputClassCount)
+                rawLabels.isNotEmpty() -> rawLabels
+                else -> (0 until outputClassCount).map { "class_$it" }
+            }
+
+            inputBuffer = ByteBuffer.allocateDirect(inTensor.numBytes()).order(ByteOrder.nativeOrder())
+            outputBuffer = ByteBuffer.allocateDirect(outTensor.numBytes()).order(ByteOrder.nativeOrder())
+            outputFloats = FloatArray(outputTotal)
+            pixelBuffer = IntArray(inputWidth * inputHeight)
+
+            Log.i(
+                TAG,
+                "model: in=${inShape.contentToString()} dtype=$inputDataType " +
+                    "out=${outShape.contentToString()} dtype=$outputDataType " +
+                    "classes=$outputClassCount labels.txt=${rawLabels.size}"
+            )
+            if (outputClassCount > 0 && rawLabels.size != outputClassCount) {
+                Log.w(
+                    TAG,
+                    "labels.txt содержит ${rawLabels.size} строк, у модели $outputClassCount классов. " +
+                        "Проверь соответствие порядка."
                 )
             }
-            val total = shape.fold(1, Int::times)
-            val inBytes = inTensor.numBytes()
-            val inBuf = ByteBuffer.allocateDirect(inBytes).order(ByteOrder.nativeOrder())
-            val outType = outTensor.dataType()
-            val outBuf = ByteBuffer.allocateDirect(outTensor.numBytes()).order(ByteOrder.nativeOrder())
 
             interpreter = interp
-            labelsAll = lbls
-            labelsForModel = modelLbls
-            imageProcessor = proc
-            inputIsUint8 = uint8
-            outputShape = shape
-            outputTotal = total
-            outputDataType = outType
-            outputQuantScale = outQuant.scale
-            outputQuantZeroPoint = outQuant.zeroPoint
-            outputClassCount = classCount
-            outputFloatBuffer = FloatArray(total)
-            outputRawBuffer = outBuf
-            outputQuantBytes =
-                if (outType == DataType.UINT8 || outType == DataType.INT8) ByteArray(outTensor.numBytes()) else null
-            inputBufferDirect = inBuf
         }
     }
 
     override fun analyze(imageProxy: ImageProxy) {
         try {
             ensureEngine()
-            analyzedFrameIndex += 1L
-            if (analyzedFrameIndex % INFERENCE_EVERY_N_FRAMES != 0L) return
+            frameIndex += 1L
+            if (frameIndex % INFERENCE_EVERY_N_FRAMES != 0L) return
+
             val interp = interpreter ?: return
-            val inBuf = inputBufferDirect ?: return
-            val proc = imageProcessor ?: return
+            val inBuf = inputBuffer ?: return
+            val outBuf = outputBuffer ?: return
 
             val rotation = imageProxy.imageInfo.rotationDegrees
             val rawBitmap = imageProxyToBitmap(imageProxy) ?: return
-            if (rawBitmap.isRecycled) {
-                Log.w(TAG_DEBUG, "skip frame: raw bitmap is recycled")
-                return
-            }
             val oriented = rotateIfNeeded(rawBitmap, rotation)
-            if (oriented.isRecycled) {
-                Log.w(TAG_DEBUG, "skip frame: oriented bitmap is recycled")
-                return
-            }
-
-            val rw = oriented.width
-            val rh = oriented.height
-            if (ENABLE_DEBUG_LOGS && !loggedFrameMeta) {
-                loggedFrameMeta = true
-                Log.i(
-                    TAG_DEBUG,
-                    "frame image=${imageProxy.width}x${imageProxy.height} rotation=$rotation oriented=${rw}x${rh}"
-                )
-            }
+            val sourceW = oriented.width
+            val sourceH = oriented.height
 
             val letterbox = letterboxBitmap(oriented)
-            val tensorImage = if (inputIsUint8) TensorImage(DataType.UINT8) else TensorImage(DataType.FLOAT32)
-            tensorImage.load(letterbox.bitmap)
-            if (letterbox.bitmap.isRecycled) {
-                Log.w(TAG_DEBUG, "skip frame: bitmap became recycled before process")
-                return
-            }
+            fillInputBuffer(letterbox.bitmap, inBuf)
 
-            val processed = proc.process(tensorImage)
-            if (!inputIsUint8) {
-                normalizeFloatBufferToUnitRange(processed.buffer)
-            }
-            feedInput(processed, inBuf)
+            inBuf.rewind()
+            outBuf.rewind()
+            interp.run(inBuf, outBuf)
+            outBuf.rewind()
+            dequantizeOutput(outBuf, outputFloats)
 
-            val rawOutput = runInference(interp, inBuf)
-            val parsed = when {
-                (outputDataType == DataType.UINT8 || outputDataType == DataType.INT8) && rawOutput.quant != null ->
-                    parseYoloV8Quant(rawOutput.quant, outputShape)
-                rawOutput.float != null ->
-                    parseYoloV8(rawOutput.float, outputShape)
-                else -> ParseResult(emptyList(), 0f)
-            }
-            val stableBoxes = stabilizeDetections(parsed.boxes)
-            if (ENABLE_DEBUG_LOGS) {
-                Log.d(
-                    TAG_DEBUG,
-                    "frameMaxScore=${String.format(Locale.US, "%.4f", parsed.maxScore)} " +
-                        "boxesAfterNms=${parsed.boxes.size} stable=${stableBoxes.size}"
-                )
-            }
-            val overlayItems = ArrayList<GraphicOverlayView.OverlayDetection>()
-            for (b in stableBoxes) {
-                val nameRaw = labelsForModel.getOrNull(b.classIndex)
-                    ?: labelsAll.getOrNull(b.classIndex)
-                    ?: "class_${b.classIndex}"
-                val name = normalizeLabel(nameRaw)
-                if (name.lowercase(Locale.ROOT) in ignoreLabels || name.isBlank()) continue
+            val boxes = parseYoloV8(outputFloats, outputShape)
+            val results = ArrayList<GraphicOverlayView.OverlayDetection>(boxes.size)
+            for (b in boxes) {
+                val raw = classNames.getOrNull(b.classIndex) ?: continue
+                if (raw.isBlank()) continue
+                val display = RUSSIAN_LABELS[raw] ?: raw
                 val rect = modelRectToImageRect(b.rect, letterbox)
                 if (rect.width() <= 1f || rect.height() <= 1f) continue
-                overlayItems.add(GraphicOverlayView.OverlayDetection(name, b.score, rect))
-                maybeSendTelemetry(name, b.score)
+                results.add(GraphicOverlayView.OverlayDetection(display, b.score, rect))
+                maybeSendTelemetry(raw, b.score)
             }
-            onResults(rw, rh, overlayItems)
+
+            if (!loggedMeta) {
+                loggedMeta = true
+                Log.i(TAG, "first inference: boxes=${results.size} oriented=${sourceW}x${sourceH}")
+            }
+            val stabilized = stabilizer.update(results)
+            onResults(sourceW, sourceH, stabilized)
         } catch (t: Throwable) {
             Log.e(TAG, "analyze failed", t)
         } finally {
@@ -218,469 +206,87 @@ class ImageAnalyzer(
         }
     }
 
-    private data class InferenceOutput(
-        val float: FloatArray? = null,
-        val quant: ByteArray? = null
-    )
-
-    private data class LetterboxFrame(
-        val bitmap: Bitmap,
-        val scale: Float,
-        val dx: Float,
-        val dy: Float,
-        val sourceWidth: Int,
-        val sourceHeight: Int
-    )
-
-    private fun runInference(interp: Interpreter, input: ByteBuffer): InferenceOutput {
-        input.rewind()
-        val rawOut = outputRawBuffer ?: return InferenceOutput(float = outputFloatBuffer)
-        rawOut.rewind()
-        interp.run(input, rawOut)
-        rawOut.rewind()
-
-        return when (outputDataType) {
-            DataType.FLOAT32 -> {
-                outputFloatBuffer.fill(0f)
-                rawOut.asFloatBuffer().get(outputFloatBuffer, 0, outputTotal)
-                InferenceOutput(float = outputFloatBuffer)
-            }
-            DataType.UINT8, DataType.INT8 -> {
-                val quant = outputQuantBytes ?: ByteArray(rawOut.remaining()).also { outputQuantBytes = it }
-                rawOut.get(quant, 0, min(quant.size, rawOut.remaining()))
-                rawOut.rewind()
-                InferenceOutput(quant = quant)
-            }
-            else -> {
-                outputFloatBuffer.fill(0f)
-                rawOut.asFloatBuffer().get(outputFloatBuffer, 0, outputTotal)
-                InferenceOutput(float = outputFloatBuffer)
-            }
-        }
-    }
-
-    private fun normalizeFloatBufferToUnitRange(buffer: ByteBuffer) {
-        buffer.rewind()
-        val fb = buffer.asFloatBuffer()
-        val n = fb.remaining()
-        if (n == 0) return
-        val arr = FloatArray(n)
-        fb.get(arr)
-        for (i in arr.indices) arr[i] /= 255f
-        buffer.rewind()
-        buffer.asFloatBuffer().put(arr)
-        buffer.rewind()
-    }
-
-    private fun feedInput(processed: TensorImage, inputBufferDirect: ByteBuffer) {
-        val buffer = processed.buffer
-        buffer.rewind()
-        inputBufferDirect.rewind()
-        val lim = min(buffer.remaining(), inputBufferDirect.remaining())
-        val tmp = ByteArray(lim)
-        buffer.get(tmp)
-        inputBufferDirect.put(tmp)
-        inputBufferDirect.rewind()
-    }
-
-    private fun maybeSendTelemetry(label: String, conf: Float) {
-        if (!ENABLE_TELEMETRY) return
-        try {
-            val now = SystemClock.elapsedRealtime()
-            val prev = lastTelemetryAtMs[label] ?: 0L
-            if (now - prev < telemetryCooldownMs) return
-            lastTelemetryAtMs[label] = now
-            FirebaseTelemetryManager.sendSignData(label, conf.toDouble())
-        } catch (e: Exception) {
-            Log.w(TAG, "telemetry: $e")
-        }
-    }
-
-    private fun inferClassCount(shape: IntArray): Int {
-        if (shape.size != 3 || shape[0] != 1) return 0
-        val dim1 = shape[1]
-        val dim2 = shape[2]
-        return when {
-            dim1 >= YOLO_CLASS_START_ROW && dim2 > dim1 -> dim1 - YOLO_CLASS_START_ROW
-            dim2 >= YOLO_CLASS_START_ROW && dim1 > dim2 -> dim2 - YOLO_CLASS_START_ROW
-            else -> 0
-        }.coerceAtLeast(0)
-    }
-
-    private fun buildModelLabels(labels: List<String>, classCount: Int): List<String> {
-        if (classCount <= 0) return labels
-        val active = labels
-            .filter { it.lowercase(Locale.ROOT) !in ignoreLabels }
-            .distinct()
-        return active.take(classCount)
-    }
-
-    private fun modelClassCount(): Int {
-        return if (outputClassCount > 0) outputClassCount else YOLO_NUM_CLASSES
-    }
-
-    private fun isIgnoredClass(classIndex: Int): Boolean {
-        val label = labelsForModel.getOrNull(classIndex)?.lowercase(Locale.ROOT) ?: return false
-        return label in ignoreLabels
-    }
+    // -------------------------------------------------------------------------
+    //  YOLOv8 head parsing
+    // -------------------------------------------------------------------------
 
     private data class Box640(val rect: RectF, val classIndex: Int, val score: Float)
-    private data class TrackedBox(
-        val box: Box640,
-        val hits: Int,
-        val classVotes: Map<Int, Int>,
-        val classScores: Map<Int, Float>
-    )
-    private data class ParseResult(val boxes: List<Box640>, val maxScore: Float)
 
-    /**
-     * Поддержка типичных экспортов YOLOv8 TFLite:
-     * - [1, 4+nc, A] или [1, A, 4+nc] (nc из модели, не из длины labels.txt)
-     * - [1, N, 6] / [1, 6, N] — xyxy + score + class (после встроенного NMS)
-     */
-    private fun stabilizeDetections(current: List<Box640>): List<Box640> {
-        if (current.isEmpty()) {
-            detectionTracks = emptyList()
-            return emptyList()
-        }
-        val previous = detectionTracks
-        val next = ArrayList<TrackedBox>()
-        val stable = ArrayList<Box640>()
-        for (box in current) {
-            val match = previous
-                .maxByOrNull { iou(it.box.rect, box.rect) }
-            val hits = if (match != null && iou(match.box.rect, box.rect) >= STABILITY_IOU_THRESHOLD) {
-                match.hits + 1
-            } else {
-                1
-            }
-            val votes = match?.classVotes?.toMutableMap() ?: mutableMapOf()
-            val scores = match?.classScores?.toMutableMap() ?: mutableMapOf()
-            votes[box.classIndex] = (votes[box.classIndex] ?: 0) + 1
-            scores[box.classIndex] = max(scores[box.classIndex] ?: 0f, box.score)
-            val stableClass = votes.maxWithOrNull(
-                compareBy<Map.Entry<Int, Int>> { it.value }
-                    .thenBy { scores[it.key] ?: 0f }
-            )?.key ?: box.classIndex
-            val stableScore = scores[stableClass] ?: box.score
-            val trackedBox = Box640(RectF(box.rect), stableClass, stableScore)
-            next.add(TrackedBox(trackedBox, hits, votes, scores))
-            if (hits >= STABLE_FRAMES_REQUIRED) stable.add(trackedBox)
-        }
-        detectionTracks = next
-        return stable
-    }
+    private fun parseYoloV8(flat: FloatArray, shape: IntArray): List<Box640> {
+        if (shape.size != 3 || shape[0] != 1) return emptyList()
+        if (outputClassCount <= 0) return emptyList()
 
-    private fun parseYoloV8(flat: FloatArray, shape: IntArray): ParseResult {
-        if (ENABLE_DEBUG_LOGS && !loggedTensorMeta) {
-            loggedTensorMeta = true
-            Log.i(TAG_DEBUG, "parseYoloV8 shape=${shape.contentToString()} flat=${flat.size}")
-        }
-        if (shape.isEmpty() || shape[0] != 1) return ParseResult(emptyList(), 0f)
+        val featureRows = YOLO_CLASS_START_ROW + outputClassCount
+        val d1 = shape[1]
+        val d2 = shape[2]
 
-        if (shape.size == 3) {
-            val a = shape[1]
-            val b = shape[2]
-            when {
-                b == 6 && a > 6 -> return parseRowsNx6(flat, a)
-                a == 6 && b > 6 -> return parseRows6xN(flat, b)
-            }
-        }
-        if (shape.size != 3) return ParseResult(emptyList(), 0f)
-
-        val dim1 = shape[1]
-        val dim2 = shape[2]
         return when {
-            dim1 == YOLO_FEATURE_ROWS && dim2 == YOLO_ANCHORS ->
-                parseYoloNineRowMajor(flat, YOLO_ANCHORS)
-            dim1 == YOLO_ANCHORS && dim2 == YOLO_FEATURE_ROWS ->
-                parseYoloNineAnchorMajor(flat, YOLO_ANCHORS)
+            // [1, F, A]: индексация index = row * A + anchor
+            d1 == featureRows -> parseLayout(flat, anchors = d2, rowMajor = true)
+            // [1, A, F]: индексация index = anchor * F + row
+            d2 == featureRows -> parseLayout(flat, anchors = d1, rowMajor = false)
             else -> {
-                Log.w(TAG, "Неизвестная форма выхода: [1,$dim1,$dim2], labels=${labelsForModel.size}")
-                ParseResult(emptyList(), 0f)
+                Log.w(TAG, "Неожиданная форма выхода: ${shape.contentToString()}, ожидалось F=$featureRows")
+                emptyList()
             }
         }
     }
 
-    private fun parseYoloV8Quant(flat: ByteArray, shape: IntArray): ParseResult {
-        if (ENABLE_DEBUG_LOGS && !loggedTensorMeta) {
-            loggedTensorMeta = true
-            Log.i(TAG_DEBUG, "parseYoloV8 shape=${shape.contentToString()} quant=${flat.size}")
-        }
-        if (shape.size != 3 || shape[0] != 1) return ParseResult(emptyList(), 0f)
-        val dim1 = shape[1]
-        val dim2 = shape[2]
-        return when {
-            dim1 == YOLO_FEATURE_ROWS && dim2 == YOLO_ANCHORS ->
-                parseYoloNineQuantByAnchors(YOLO_ANCHORS) { row, anchor ->
-                    val index = row * YOLO_ANCHORS + anchor
-                    if (index in flat.indices) quantToRawInt(flat[index]) else 0
-                }
-            dim1 == YOLO_ANCHORS && dim2 == YOLO_FEATURE_ROWS ->
-                parseYoloNineQuantByAnchors(YOLO_ANCHORS) { row, anchor ->
-                    val index = anchor * YOLO_FEATURE_ROWS + row
-                    if (index in flat.indices) quantToRawInt(flat[index]) else 0
-                }
-            else -> {
-                Log.w(TAG, "РќРµРёР·РІРµСЃС‚РЅР°СЏ С„РѕСЂРјР° РІС‹С…РѕРґР° quant: [1,$dim1,$dim2]")
-                ParseResult(emptyList(), 0f)
-            }
-        }
-    }
-
-    private fun parseYoloNineRowMajor(
-        flat: FloatArray,
-        numAnchors: Int
-    ): ParseResult {
-        return parseYoloNineByAnchors(numAnchors) { row, anchor ->
-            val index = row * numAnchors + anchor
-            if (index in flat.indices) flat[index] else 0f
-        }
-    }
-
-    private fun parseYoloNineAnchorMajor(
-        flat: FloatArray,
-        numAnchors: Int
-    ): ParseResult {
-        return parseYoloNineByAnchors(numAnchors) { row, anchor ->
-            val index = anchor * YOLO_FEATURE_ROWS + row
-            if (index in flat.indices) flat[index] else 0f
-        }
-    }
-
-    private fun parseYoloNineByAnchors(
-        numAnchors: Int,
-        valueAt: (row: Int, anchor: Int) -> Float
-    ): ParseResult {
+    private fun parseLayout(flat: FloatArray, anchors: Int, rowMajor: Boolean): List<Box640> {
+        val featureRows = YOLO_CLASS_START_ROW + outputClassCount
+        val classCount = outputClassCount
         val raw = ArrayList<Triple<RectF, Int, Float>>()
-        var maxScoreSeen = 0f
-        val classCount = modelClassCount()
-        for (anchor in 0 until numAnchors) {
-            var bestCls = 0
+        val confTh = confidenceThreshold
+
+        for (anchor in 0 until anchors) {
+            var bestCls = -1
             var bestScore = 0f
-            var secondBestScore = 0f
             for (c in 0 until classCount) {
                 val row = YOLO_CLASS_START_ROW + c
-                val score = toClassProb(valueAt(row, anchor))
-                if (score > bestScore) {
-                    secondBestScore = bestScore
-                    bestScore = score
+                val idx = if (rowMajor) row * anchors + anchor else anchor * featureRows + row
+                if (idx >= flat.size) continue
+                val s = toClassProb(flat[idx])
+                if (s > bestScore) {
+                    bestScore = s
                     bestCls = c
-                } else if (score > secondBestScore) {
-                    secondBestScore = score
                 }
             }
-            if (bestScore > maxScoreSeen) maxScoreSeen = bestScore
-            if (bestScore <= CONF_THRESHOLD) continue
-            if (bestScore - secondBestScore < CLASS_MARGIN_THRESHOLD) continue
-            if (isIgnoredClass(bestCls)) continue
+            if (bestCls < 0 || bestScore < confTh) continue
 
-            val xCenter = valueAt(0, anchor)
-            val yCenter = valueAt(1, anchor)
-            val w = valueAt(2, anchor)
-            val h = valueAt(3, anchor)
-            val rect = decodeBox640Strict(xCenter, yCenter, w, h)
-            if (rect.width() <= 1f || rect.height() <= 1f) continue
+            val xIdx = if (rowMajor) anchor else anchor * featureRows
+            val yIdx = if (rowMajor) anchors + anchor else anchor * featureRows + 1
+            val wIdx = if (rowMajor) 2 * anchors + anchor else anchor * featureRows + 2
+            val hIdx = if (rowMajor) 3 * anchors + anchor else anchor * featureRows + 3
+            if (hIdx >= flat.size) continue
+
+            val rect = decodeBox(flat[xIdx], flat[yIdx], flat[wIdx], flat[hIdx]) ?: continue
             raw.add(Triple(rect, bestCls, bestScore))
         }
-        return ParseResult(nms(raw), maxScoreSeen)
+
+        return nms(raw)
     }
 
-    private fun parseYoloNineQuantByAnchors(
-        numAnchors: Int,
-        rawAt: (row: Int, anchor: Int) -> Int
-    ): ParseResult {
-        val raw = ArrayList<Triple<RectF, Int, Float>>()
-        var maxScoreSeen = 0f
-        val classCount = modelClassCount()
-        for (anchor in 0 until numAnchors) {
-            var bestCls = 0
-            var bestScore = 0f
-            var secondBestScore = 0f
-            for (c in 0 until classCount) {
-                val row = YOLO_CLASS_START_ROW + c
-                val score = toClassProb(dequantizeQuantValue(rawAt(row, anchor)))
-                if (score > bestScore) {
-                    secondBestScore = bestScore
-                    bestScore = score
-                    bestCls = c
-                } else if (score > secondBestScore) {
-                    secondBestScore = score
-                }
-            }
-            if (bestScore > maxScoreSeen) maxScoreSeen = bestScore
-            if (bestScore <= CONF_THRESHOLD) continue
-            if (bestScore - secondBestScore < CLASS_MARGIN_THRESHOLD) continue
-            if (isIgnoredClass(bestCls)) continue
-
-            val xCenter = dequantizeQuantValue(rawAt(0, anchor))
-            val yCenter = dequantizeQuantValue(rawAt(1, anchor))
-            val w = dequantizeQuantValue(rawAt(2, anchor))
-            val h = dequantizeQuantValue(rawAt(3, anchor))
-            val rect = decodeBox640Strict(xCenter, yCenter, w, h)
-            if (rect.width() <= 1f || rect.height() <= 1f) continue
-            raw.add(Triple(rect, bestCls, bestScore))
-        }
-        return ParseResult(nms(raw), maxScoreSeen)
-    }
-
-    /** [1, N, 6]: x1,y1,x2,y2,score,class */
-    private fun parseRowsNx6(flat: FloatArray, n: Int): ParseResult {
-        val raw = ArrayList<Triple<RectF, Int, Float>>()
-        var maxScoreSeen = 0f
-        for (i in 0 until n) {
-            val o = i * 6
-            if (o + 5 >= flat.size) break
-            val x1 = flat[o]
-            val y1 = flat[o + 1]
-            val x2 = flat[o + 2]
-            val y2 = flat[o + 3]
-            val score = toClassProb(flat[o + 4])
-            if (score > maxScoreSeen) maxScoreSeen = score
-            val cls = flat[o + 5].toInt().coerceAtLeast(0)
-            if (score < CONF_THRESHOLD) continue
-            if (x2 <= x1 || y2 <= y1) continue
-            raw.add(Triple(RectF(x1, y1, x2, y2), cls, score))
-        }
-        return ParseResult(nms(raw), maxScoreSeen)
-    }
-
-    /** [1, 6, N]: по строкам признаков */
-    private fun parseRows6xN(flat: FloatArray, n: Int): ParseResult {
-        val raw = ArrayList<Triple<RectF, Int, Float>>()
-        var maxScoreSeen = 0f
-        for (i in 0 until n) {
-            val x1 = flat[0 * n + i]
-            val y1 = flat[1 * n + i]
-            val x2 = flat[2 * n + i]
-            val y2 = flat[3 * n + i]
-            val score = toClassProb(flat[4 * n + i])
-            if (score > maxScoreSeen) maxScoreSeen = score
-            val cls = flat[5 * n + i].toInt().coerceAtLeast(0)
-            if (score < CONF_THRESHOLD) continue
-            if (x2 <= x1 || y2 <= y1) continue
-            raw.add(Triple(RectF(x1, y1, x2, y2), cls, score))
-        }
-        return ParseResult(nms(raw), maxScoreSeen)
-    }
-
-    private fun quantToRawInt(v: Byte): Int {
-        return if (outputDataType == DataType.UINT8) v.toInt() and 0xFF else v.toInt()
-    }
-
-    private fun dequantizeQuantValue(raw: Int): Float {
-        return (raw - outputQuantZeroPoint) * outputQuantScale
-    }
-
-    private fun toClassProb(raw: Float): Float {
-        if (!raw.isFinite()) return 0f
-        if (raw in 0f..1f) return raw
-        return sigmoid(raw)
-    }
-
-    private fun normalizeLabel(raw: String): String = raw.trim().trimEnd('\\')
-
-    private fun letterboxBitmap(src: Bitmap): LetterboxFrame {
-        val scale = min(MODEL_SIZE / src.width.toFloat(), MODEL_SIZE / src.height.toFloat())
-        val scaledWidth = src.width * scale
-        val scaledHeight = src.height * scale
-        val dx = (MODEL_SIZE - scaledWidth) / 2f
-        val dy = (MODEL_SIZE - scaledHeight) / 2f
-        val out = Bitmap.createBitmap(MODEL_SIZE, MODEL_SIZE, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(out)
-        canvas.drawColor(Color.BLACK)
-        canvas.drawBitmap(src, null, RectF(dx, dy, dx + scaledWidth, dy + scaledHeight), letterboxPaint)
-        return LetterboxFrame(out, scale, dx, dy, src.width, src.height)
-    }
-
-    private fun modelRectToImageRect(rect: RectF, frame: LetterboxFrame): RectF {
-        val left = ((rect.left - frame.dx) / frame.scale).coerceIn(0f, frame.sourceWidth.toFloat())
-        val top = ((rect.top - frame.dy) / frame.scale).coerceIn(0f, frame.sourceHeight.toFloat())
-        val right = ((rect.right - frame.dx) / frame.scale).coerceIn(0f, frame.sourceWidth.toFloat())
-        val bottom = ((rect.bottom - frame.dy) / frame.scale).coerceIn(0f, frame.sourceHeight.toFloat())
-        return RectF(left, top, right, bottom)
-    }
-
-    private fun decodeBox640(p0: Float, p1: Float, p2: Float, p3: Float): RectF {
-        // Для head YOLOv8 [1, 4+nc, A] ожидаем cx,cy,w,h.
-        var cx = p0
-        var cy = p1
-        var w = p2
-        var h = p3
-        if (maxOf(cx, cy, w, h) <= 2f) {
-            cx *= MODEL_SIZE
-            cy *= MODEL_SIZE
-            w *= MODEL_SIZE
-            h *= MODEL_SIZE
-        }
-        val halfW = w / 2f
-        val halfH = h / 2f
-        return RectF(
-            (cx - halfW).coerceIn(0f, MODEL_SIZE.toFloat()),
-            (cy - halfH).coerceIn(0f, MODEL_SIZE.toFloat()),
-            (cx + halfW).coerceIn(0f, MODEL_SIZE.toFloat()),
-            (cy + halfH).coerceIn(0f, MODEL_SIZE.toFloat())
-        )
-    }
-
-    private fun decodeBox640Strict(p0: Float, p1: Float, p2: Float, p3: Float): RectF {
-        var cx = p0
-        var cy = p1
-        var w = p2
-        var h = p3
-        if (!cx.isFinite() || !cy.isFinite() || !w.isFinite() || !h.isFinite()) return RectF()
-        if (maxOf(cx, cy, w, h) <= 2f) {
-            cx *= MODEL_SIZE
-            cy *= MODEL_SIZE
-            w *= MODEL_SIZE
-            h *= MODEL_SIZE
-        }
-        if (w <= 0f || h <= 0f) return RectF()
-        val halfW = w / 2f
-        val halfH = h / 2f
-        val left = cx - halfW
-        val top = cy - halfH
-        val right = cx + halfW
-        val bottom = cy + halfH
-        if (right <= 0f || bottom <= 0f || left >= MODEL_SIZE || top >= MODEL_SIZE) return RectF()
-        return RectF(
-            left.coerceIn(0f, MODEL_SIZE.toFloat()),
-            top.coerceIn(0f, MODEL_SIZE.toFloat()),
-            right.coerceIn(0f, MODEL_SIZE.toFloat()),
-            bottom.coerceIn(0f, MODEL_SIZE.toFloat())
-        )
-    }
-
-    private fun nms(
-        boxes: List<Triple<RectF, Int, Float>>,
-        iouTh: Float = NMS_IOU_THRESHOLD,
-        limit: Int = MAX_DETECTIONS
-    ): List<Box640> {
+    private fun nms(boxes: List<Triple<RectF, Int, Float>>): List<Box640> {
+        if (boxes.isEmpty()) return emptyList()
         val sorted = boxes.sortedByDescending { it.third }
         val kept = ArrayList<Box640>()
-        val perClassCount = HashMap<Int, Int>()
         for (t in sorted) {
-            if (kept.size >= limit) break
+            if (kept.size >= MAX_DETECTIONS) break
             val r = t.first
-            val area = r.width() * r.height()
             if (r.width() < MIN_BOX_SIZE_PX || r.height() < MIN_BOX_SIZE_PX) continue
-            if (area > MODEL_SIZE * MODEL_SIZE * MAX_BOX_AREA_RATIO) continue
+            val area = r.width() * r.height()
+            if (area > inputWidth.toFloat() * inputHeight.toFloat() * MAX_BOX_AREA_RATIO) continue
             val aspect = r.width() / r.height()
             if (aspect < MIN_BOX_ASPECT_RATIO || aspect > MAX_BOX_ASPECT_RATIO) continue
-            val cls = t.second
-            val clsCount = perClassCount[cls] ?: 0
-            if (clsCount >= MAX_BOXES_PER_CLASS) continue
-            var ok = true
+
+            var keep = true
             for (k in kept) {
-                if (iou(r, k.rect) > iouTh) {
-                    ok = false
+                if (iou(r, k.rect) > NMS_IOU_THRESHOLD) {
+                    keep = false
                     break
                 }
             }
-            if (ok) {
-                kept.add(Box640(RectF(r), cls, t.third))
-                perClassCount[cls] = clsCount + 1
-            }
+            if (keep) kept.add(Box640(RectF(r), t.second, t.third))
         }
         return kept
     }
@@ -697,22 +303,161 @@ class ImageAnalyzer(
         return if (u <= 0f) 0f else inter / u
     }
 
-    private fun sigmoid(x: Float): Float =
-        (1.0 / (1.0 + exp(-x.toDouble()))).toFloat()
+    private fun decodeBox(p0: Float, p1: Float, p2: Float, p3: Float): RectF? {
+        if (!p0.isFinite() || !p1.isFinite() || !p2.isFinite() || !p3.isFinite()) return null
+        var cx = p0
+        var cy = p1
+        var w = p2
+        var h = p3
+        // Некоторые экспорты отдают координаты в [0,1].
+        if (max(max(cx, cy), max(w, h)) <= 2f) {
+            cx *= inputWidth
+            cy *= inputHeight
+            w *= inputWidth
+            h *= inputHeight
+        }
+        if (w <= 0f || h <= 0f) return null
+        val left = cx - w / 2f
+        val top = cy - h / 2f
+        val right = cx + w / 2f
+        val bottom = cy + h / 2f
+        if (right <= 0f || bottom <= 0f || left >= inputWidth || top >= inputHeight) return null
+        return RectF(
+            left.coerceIn(0f, inputWidth.toFloat()),
+            top.coerceIn(0f, inputHeight.toFloat()),
+            right.coerceIn(0f, inputWidth.toFloat()),
+            bottom.coerceIn(0f, inputHeight.toFloat())
+        )
+    }
+
+    private fun toClassProb(v: Float): Float {
+        if (!v.isFinite()) return 0f
+        // YOLOv8 экспортирует уже сигмоидальные классы. Logits страхуем через sigmoid.
+        return if (v in 0f..1f) v else sigmoid(v)
+    }
+
+    private fun sigmoid(x: Float): Float = (1.0 / (1.0 + exp(-x.toDouble()))).toFloat()
+
+    private fun inferClassCount(shape: IntArray): Int {
+        if (shape.size != 3 || shape[0] != 1) return 0
+        val d1 = shape[1]
+        val d2 = shape[2]
+        // Признаков всегда меньше, чем якорей; идентифицируем меньшее измерение.
+        val featureDim = min(d1, d2)
+        return (featureDim - YOLO_CLASS_START_ROW).coerceAtLeast(0)
+    }
+
+    // -------------------------------------------------------------------------
+    //  Input / output buffer fill
+    // -------------------------------------------------------------------------
+
+    private fun fillInputBuffer(bitmap: Bitmap, buf: ByteBuffer) {
+        val w = inputWidth
+        val h = inputHeight
+        val src = if (bitmap.width == w && bitmap.height == h) bitmap
+                  else Bitmap.createScaledBitmap(bitmap, w, h, true)
+
+        if (pixelBuffer.size != w * h) pixelBuffer = IntArray(w * h)
+        src.getPixels(pixelBuffer, 0, w, 0, 0, w, h)
+
+        buf.rewind()
+        when (inputDataType) {
+            DataType.FLOAT32 -> {
+                val fb = buf.asFloatBuffer()
+                for (p in pixelBuffer) {
+                    fb.put(((p shr 16) and 0xFF) / 255f)
+                    fb.put(((p shr 8) and 0xFF) / 255f)
+                    fb.put((p and 0xFF) / 255f)
+                }
+            }
+            DataType.UINT8 -> {
+                for (p in pixelBuffer) {
+                    buf.put(((p shr 16) and 0xFF).toByte())
+                    buf.put(((p shr 8) and 0xFF).toByte())
+                    buf.put((p and 0xFF).toByte())
+                }
+            }
+            DataType.INT8 -> {
+                // YOLOv8 INT8: scale ≈ 1/255, zeroPoint = -128 ⇒ INT8 = UINT8 − 128.
+                for (p in pixelBuffer) {
+                    buf.put((((p shr 16) and 0xFF) - 128).toByte())
+                    buf.put((((p shr 8) and 0xFF) - 128).toByte())
+                    buf.put(((p and 0xFF) - 128).toByte())
+                }
+            }
+            else -> throw IllegalStateException("Неподдерживаемый тип входа: $inputDataType")
+        }
+        buf.rewind()
+    }
+
+    private fun dequantizeOutput(buf: ByteBuffer, out: FloatArray) {
+        buf.rewind()
+        when (outputDataType) {
+            DataType.FLOAT32 -> {
+                val n = min(out.size, buf.remaining() / 4)
+                buf.asFloatBuffer().get(out, 0, n)
+            }
+            DataType.UINT8 -> {
+                val n = min(out.size, buf.remaining())
+                for (i in 0 until n) {
+                    val raw = buf.get(i).toInt() and 0xFF
+                    out[i] = (raw - outputQuantZeroPoint) * outputQuantScale
+                }
+            }
+            DataType.INT8 -> {
+                val n = min(out.size, buf.remaining())
+                for (i in 0 until n) {
+                    val raw = buf.get(i).toInt()
+                    out[i] = (raw - outputQuantZeroPoint) * outputQuantScale
+                }
+            }
+            else -> Log.w(TAG, "Неподдерживаемый тип выхода: $outputDataType")
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    //  Bitmap helpers
+    // -------------------------------------------------------------------------
+
+    private data class LetterboxFrame(
+        val bitmap: Bitmap,
+        val scale: Float,
+        val dx: Float,
+        val dy: Float,
+        val sourceWidth: Int,
+        val sourceHeight: Int
+    )
+
+    private fun letterboxBitmap(src: Bitmap): LetterboxFrame {
+        val scale = min(inputWidth / src.width.toFloat(), inputHeight / src.height.toFloat())
+        val scaledW = src.width * scale
+        val scaledH = src.height * scale
+        val dx = (inputWidth - scaledW) / 2f
+        val dy = (inputHeight - scaledH) / 2f
+        val out = Bitmap.createBitmap(inputWidth, inputHeight, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawColor(Color.BLACK)
+        canvas.drawBitmap(src, null, RectF(dx, dy, dx + scaledW, dy + scaledH), letterboxPaint)
+        return LetterboxFrame(out, scale, dx, dy, src.width, src.height)
+    }
+
+    private fun modelRectToImageRect(rect: RectF, frame: LetterboxFrame): RectF {
+        val left = ((rect.left - frame.dx) / frame.scale).coerceIn(0f, frame.sourceWidth.toFloat())
+        val top = ((rect.top - frame.dy) / frame.scale).coerceIn(0f, frame.sourceHeight.toFloat())
+        val right = ((rect.right - frame.dx) / frame.scale).coerceIn(0f, frame.sourceWidth.toFloat())
+        val bottom = ((rect.bottom - frame.dy) / frame.scale).coerceIn(0f, frame.sourceHeight.toFloat())
+        return RectF(left, top, right, bottom)
+    }
 
     private fun rotateIfNeeded(src: Bitmap, rotationDegrees: Int): Bitmap {
         if (rotationDegrees == 0) return src
-        val m = Matrix()
-        m.postRotate(rotationDegrees.toFloat())
+        val m = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
         return Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, true)
     }
 
     private fun imageProxyToBitmap(image: ImageProxy): Bitmap? {
-        return if (image.planes.size == 1) {
-            rgbaImageProxyToBitmap(image)
-        } else {
-            yuv420888ToBitmap(image)
-        }
+        return if (image.planes.size == 1) rgbaImageProxyToBitmap(image)
+               else yuv420888ToBitmap(image)
     }
 
     private fun rgbaImageProxyToBitmap(image: ImageProxy): Bitmap? {
@@ -803,27 +548,103 @@ class ImageAnalyzer(
         }
     }
 
+    // -------------------------------------------------------------------------
+    //  Telemetry
+    // -------------------------------------------------------------------------
+
+    private fun maybeSendTelemetry(label: String, conf: Float) {
+        if (!ENABLE_TELEMETRY) return
+        try {
+            val now = SystemClock.elapsedRealtime()
+            val prev = lastTelemetryAtMs[label] ?: 0L
+            if (now - prev < telemetryCooldownMs) return
+            lastTelemetryAtMs[label] = now
+            FirebaseTelemetryManager.sendSignData(label, conf.toDouble())
+        } catch (e: Exception) {
+            Log.w(TAG, "telemetry: $e")
+        }
+    }
+
     companion object {
         private const val TAG = "ImageAnalyzer"
-        private const val TAG_DEBUG = "YOLO_DEBUG"
+
+        private const val MODEL_FILE = "best_int8.tflite"
+        private const val LABELS_FILE = "labels.txt"
+
         private const val MODEL_SIZE = 640
-        private const val YOLO_FEATURE_ROWS = 9
-        private const val YOLO_ANCHORS = 8400
         private const val YOLO_CLASS_START_ROW = 4
-        private const val YOLO_NUM_CLASSES = 5
-        private const val CONF_THRESHOLD = 0.70f
-        private const val CLASS_MARGIN_THRESHOLD = 0.14f
-        private const val NMS_IOU_THRESHOLD = 0.30f
-        private const val MAX_DETECTIONS = 6
-        private const val MAX_BOXES_PER_CLASS = 1
+
+        // Пороги детекции
+        const val DEFAULT_CONF_THRESHOLD = 0.50f
+        private const val NMS_IOU_THRESHOLD = 0.45f
+        private const val MAX_DETECTIONS = 20
+
+        // Санити-фильтры для бокса (в координатах входа модели 640×640).
         private const val MIN_BOX_SIZE_PX = 12f
-        private const val MAX_BOX_AREA_RATIO = 0.65f
-        private const val MIN_BOX_ASPECT_RATIO = 0.50f
-        private const val MAX_BOX_ASPECT_RATIO = 2.00f
-        private const val STABILITY_IOU_THRESHOLD = 0.25f
-        private const val STABLE_FRAMES_REQUIRED = 2
+        private const val MAX_BOX_AREA_RATIO = 0.85f
+        private const val MIN_BOX_ASPECT_RATIO = 0.40f
+        private const val MAX_BOX_ASPECT_RATIO = 2.50f
+
         private const val INFERENCE_EVERY_N_FRAMES = 1L
         private const val ENABLE_TELEMETRY = false
-        private const val ENABLE_DEBUG_LOGS = false
+
+        /** Соответствие имени класса из labels.txt → подпись для отрисовки. */
+        private val RUSSIAN_LABELS: Map<String, String> = mapOf(
+            "asosiy_yol" to "Главная дорога",
+            "avtobus_bekati" to "Остановка автобуса",
+            "aylanma_harakat" to "Круговое движение",
+            "aylanma_harakat_kesishuv" to "Пересечение с круговым движением",
+            "bolalar" to "Дети",
+            "boshqa_xavf_xatar" to "Прочие опасности",
+            "chapdan_chetlab_otish" to "Объезд препятствия слева",
+            "chapdan_yol_torayishi" to "Сужение дороги слева",
+            "chapga_taqiqlanadi" to "Поворот налево запрещён",
+            "chapga_yoki_onga" to "Движение налево или направо",
+            "chorraha" to "Пересечение равнозначных дорог",
+            "faqat_togri" to "Движение прямо",
+            "harakatlanish_chapga" to "Движение налево",
+            "harakatlanish_onga" to "Движение направо",
+            "harakatlanish_taqiqlanadi" to "Движение запрещено",
+            "keskin_chapga" to "Опасный поворот налево",
+            "keskin_onga" to "Опасный поворот направо",
+            "kirish_taqiqlanadi" to "Въезд запрещён",
+            "notekis_yol" to "Неровная дорога",
+            "oldinda_chapga_burilish" to "Направление поворота налево",
+            "oldinda_onga_burilish" to "Направление поворота направо",
+            "ondan_yoki_chapdan_chetlab_otish" to "Объезд препятствия справа или слева",
+            "onga_taqiqlanadi" to "Поворот направо запрещён",
+            "ongdan_chetlab_otish" to "Объезд препятствия справа",
+            "ongdan_yol_torayishi" to "Сужение дороги справа",
+            "ortga_qaytish" to "Разворот",
+            "piyodalar_otish_joyi" to "Пешеходный переход",
+            "piyodalar_otish_ogohlantirish" to "Предупреждение: пешеходный переход",
+            "qayrilish_taqiqlanadi" to "Разворот запрещён",
+            "qizil_chiroq" to "Красный сигнал светофора",
+            "quvib_otish_taqiqlanadi" to "Обгон запрещён",
+            "sariq_chiroq" to "Жёлтый сигнал светофора",
+            "sirpanchiq_yol" to "Скользкая дорога",
+            "stop_belgisi" to "Движение без остановки запрещено",
+            "suniy_notekislik" to "Искусственная неровность",
+            "svetafor_ogohlantirish" to "Светофорное регулирование",
+            "tamirlash_ishlari" to "Дорожные работы",
+            "tezlik_10" to "Ограничение скорости 10",
+            "tezlik_20" to "Ограничение скорости 20",
+            "tezlik_30" to "Ограничение скорости 30",
+            "tezlik_50" to "Ограничение скорости 50",
+            "tezlik_60" to "Ограничение скорости 60",
+            "tezlik_70" to "Ограничение скорости 70",
+            "tezlik_80" to "Ограничение скорости 80",
+            "togri_yoki_chapga" to "Движение прямо или налево",
+            "togri_yoki_onga" to "Движение прямо или направо",
+            "toxtab_turish_taqiqlanadi" to "Стоянка запрещена",
+            "toxtash_taqiqlanadi" to "Остановка запрещена",
+            "turargoh" to "Парковка",
+            "yashil_chiroq" to "Зелёный сигнал светофора",
+            "yol_bering" to "Уступите дорогу",
+            "yol_torayishi" to "Сужение дороги",
+            "yovvoyi_hayvonlar_xavfi" to "Дикие животные",
+            "yuk_avto_taqiqlanadi" to "Движение грузовых автомобилей запрещено",
+            "zebra_chizigi" to "Зебра (разметка)"
+        )
     }
 }

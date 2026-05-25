@@ -1,7 +1,6 @@
 [versions]
 agp = "8.13.2"
 kotlin = "2.0.21"
-googleServices = "4.4.2"
 camerax = "1.4.2"
 coreKtx = "1.10.1"
 junit = "4.13.2"
@@ -29,5 +28,4 @@ androidx-camera-view = { group = "androidx.camera", name = "camera-view", versio
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
-google-services = { id = "com.google.gms.google-services", version.ref = "googleServices" }
 

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Слои снизу вверх: превью камеры → панели подписи (для отчёта/UX) → прозрачный оверлей с рамками.
-  tools:* — только превью в Android Studio, на устройстве не попадает в APK.
+  Слои снизу вверх: превью камеры → прозрачный оверлей с рамками → верхняя панель.
+  Минимальный «шелл» приложения: заголовок, индикатор озвучки, кнопка настроек.
 -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
@@ -29,52 +29,49 @@
         android:keepScreenOn="true" />
 
     <LinearLayout
-        android:id="@+id/top_panel"
+        android:id="@+id/top_bar"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="top"
         android:background="@color/ui_scrim"
-        android:clickable="false"
-        android:focusable="false"
-        android:orientation="vertical"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
         android:paddingStart="16dp"
-        android:paddingTop="12dp"
-        android:paddingEnd="16dp"
-        android:paddingBottom="12dp">
+        android:paddingTop="10dp"
+        android:paddingEnd="6dp"
+        android:paddingBottom="10dp">
 
         <TextView
             android:id="@+id/title_text"
-            android:layout_width="match_parent"
+            android:layout_width="0dp"
             android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:maxLines="1"
             android:text="@string/main_title"
             android:textColor="@color/white"
-            android:textSize="18sp"
+            android:textSize="17sp"
             android:textStyle="bold" />
 
-        <TextView
-            android:id="@+id/subtitle_text"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:text="@string/main_subtitle"
-            android:textColor="#E0FFFFFF"
-            android:textSize="13sp" />
-    </LinearLayout>
+        <ImageButton
+            android:id="@+id/tts_indicator"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/settings_tts"
+            android:padding="8dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_volume_up" />
 
-    <TextView
-        android:id="@+id/bottom_hint"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_gravity="bottom"
-        android:background="@color/ui_scrim_light"
-        android:clickable="false"
-        android:focusable="false"
-        android:paddingStart="14dp"
-        android:paddingTop="10dp"
-        android:paddingEnd="14dp"
-        android:paddingBottom="10dp"
-        android:text="@string/main_hint_overlay"
-        android:textColor="#E6FFFFFF"
-        android:textSize="12sp" />
+        <ImageButton
+            android:id="@+id/settings_button"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/settings_title"
+            android:padding="8dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_settings" />
+    </LinearLayout>
 
 </FrameLayout>
