@@ -1,6 +1,28 @@
 <resources>
     <string name="app_name">dps_zn</string>
     <string name="main_title">Распознавание знаков</string>
-    <string name="main_subtitle">Превью камеры · нейросеть YOLOv8 (INT8)</string>
-    <string name="main_hint_overlay">При обнаружении знака: зелёная рамка и подпись «класс · уверенность %» поверх кадра</string>
+
+    <string name="camera_permission_required">Нужен доступ к камере</string>
+
+    <string name="settings_title">Настройки</string>
+    <string name="settings_save">Сохранить</string>
+    <string name="settings_cancel">Отмена</string>
+
+    <string name="settings_tts">Озвучка распознанных знаков</string>
+    <string name="settings_tts_hint">Системный TTS, оффлайн. Один и тот же знак не повторяется чаще раза в 6 секунд.</string>
+
+    <string name="settings_tts_status_initializing">Загрузка движка озвучки…</string>
+    <string name="settings_tts_status_ready_ru">Голос: русский</string>
+    <string name="settings_tts_status_fallback">Русский голос не установлен. Откройте настройки голоса и установите русские данные.</string>
+    <string name="settings_tts_status_unavailable">TTS-движок не найден. Установите Google TTS или включите его в системных настройках.</string>
+
+    <string name="settings_tts_test">Тест</string>
+    <string name="settings_tts_open_system">Настройки голоса</string>
+
+    <string name="settings_threshold">Порог уверенности</string>
+    <string name="settings_threshold_hint">Ниже — больше срабатываний, но и больше ложных. Выше — стабильнее, но дальние знаки могут не ловиться.</string>
+
+    <string name="tts_unavailable">Озвучка недоступна на устройстве: голосовой движок не установлен</string>
+    <string name="tts_open_failed">Не удалось открыть настройки TTS</string>
+    <string name="tts_test_no_engine">Голос не готов: установите русский TTS-голос в системных настройках</string>
 </resources>

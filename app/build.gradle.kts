@@ -1,8 +1,9 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
-    alias(libs.plugins.google.services)
 }
+
+apply(plugin = "com.google.gms.google-services")
 
 android {
     namespace = "com.example.dps_zn"

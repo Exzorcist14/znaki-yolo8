@@ -14,3 +14,35 @@
 .cxx
 local.properties
 .idea/
+.kotlin/
+
+# Локальные сборки приложения (содержат сгенерированные артефакты, в репо не нужны)
+**/build/
+
+# IDE / редакторы
+.vscode/
+.vs/
+
+# Cursor / Codex / прочие AI-ассистенты — служебные файлы и контекст
+.cursor/
+.cursorrules
+.cursorignore
+.cursor-server/
+.codex/
+codex.json
+.codex.json
+AGENTS.md
+.aider*
+.continue/
+
+# Локальные заметки и инструкции, не для публичного репозитория
+Инструкция.txt
+NOTES.md
+TODO.local.md
+
+# Прочий шум
+*.log
+*.bak
+*.tmp
+*.swp
+*.orig
