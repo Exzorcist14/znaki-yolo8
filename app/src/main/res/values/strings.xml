@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">dps_zn</string>
+    <string name="app_name">Знаки ПДД</string>
     <string name="main_title">Распознавание знаков</string>
 
     <string name="camera_permission_required">Нужен доступ к камере</string>
